@@ -1,9 +1,13 @@
 import os
 import time
 import threading
+import logging
+
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from pocketoptionapi import PocketOption
+
+logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="МАРК 1")
 
@@ -15,8 +19,9 @@ state = {
     "connected": False,
     "asset": ASSET,
     "period": PERIOD,
-    "message": "МАРК 1 очікує підключення",
+    "message": "МАРК 1 запускається...",
     "signal": "НЕ ВХОДИТИ",
+    "candles": 0,
 }
 
 client = None
@@ -24,12 +29,10 @@ client = None
 
 def ema(values, span):
     alpha = 2 / (span + 1)
-    result = [values[0]]
-
+    result = values[0]
     for value in values[1:]:
-        result.append(alpha * value + (1 - alpha) * result[-1])
-
-    return result[-1]
+        result = alpha * value + (1 - alpha) * result
+    return result
 
 
 def rsi(values, period=14):
@@ -77,31 +80,79 @@ def worker():
     global client
 
     if not SSID:
-        state["message"] = "SSID не задано — режим очікування"
+        state["message"] = "❌ PO_SSID не задано"
+        logging.error("PO_SSID is empty")
         return
 
     try:
+        logging.info("МАРК 1: підключення до Pocket Option DEMO...")
+
         client = PocketOption(SSID)
         ok, error = client.connect()
 
         if not ok:
-            state["message"] = f"Помилка підключення: {error}"
+            state["message"] = f"❌ Помилка: {error}"
+            logging.error("Connection failed: %s", error)
             return
 
-        while not (client.check_connect() and client.is_time_synced()):
+        deadline = time.time() + 30
+
+        while time.time() < deadline:
+            if client.check_connect() and client.is_time_synced():
+                break
             time.sleep(0.5)
 
-        state["connected"] = True
-        state["message"] = "МАРК 1 підключений до DEMO"
+        if not (client.check_connect() and client.is_time_synced()):
+            state["message"] = "❌ Не завершилась синхронізація"
+            return
 
-        client.subscribe(ASSET, period=PERIOD)
+        state["connected"] = True
+        state["message"] = "✅ Pocket Option DEMO підключено"
+
+        logging.info("Pocket Option DEMO connected")
+
+        if not client.subscribe(ASSET, period=PERIOD):
+            state["message"] = "⚠️ DEMO підключено, але актив не підписаний"
+            return
+
+        logging.info("Subscribed to %s", ASSET)
+
+        time.sleep(2)
+
+        raw = client.get_historical_candles(
+            ASSET,
+            PERIOD,
+            offset=9000,
+            count_request=1
+        )
+
+        if raw:
+            df = client.process_candles_data(raw, PERIOD)
+
+            if df is not None and not df.empty and "close" in df.columns:
+                closes = df["close"].astype(float).tolist()
+
+                state["candles"] = len(closes)
+                state["signal"] = make_signal(closes)
+                state["message"] = "✅ DEMO підключено + свічки отримуються"
+
+                logging.info(
+                    "TEST OK: candles=%s signal=%s",
+                    len(closes),
+                    state["signal"]
+                )
+            else:
+                state["message"] = "⚠️ Свічки отримані, але не обробились"
+        else:
+            state["message"] = "⚠️ Свічки не отримані"
 
         while True:
-            time.sleep(2)
+            time.sleep(5)
 
     except Exception as error:
         state["connected"] = False
-        state["message"] = f"З'єднання зупинено: {type(error).__name__}"
+        state["message"] = f"❌ Помилка: {type(error).__name__}"
+        logging.exception("MARK 1 stopped")
 
 
 @app.on_event("startup")
@@ -153,50 +204,36 @@ body {
 <p>Режим: <b>DEMO</b></p>
 <p>Актив: <b id="asset">—</b></p>
 <p>Статус: <b id="status">—</b></p>
+<p>Свічки: <b id="candles">—</b></p>
 </div>
 
 <div class="card">
-<div class="signal" id="signal">
-НЕ ВХОДИТИ
-</div>
+<div class="signal" id="signal">НЕ ВХОДИТИ</div>
 </div>
 
 <div class="card">
-<p>МАРК 1 працює в режимі аналізу.</p>
-<p>Автоматичне відкриття угод вимкнено.</p>
+<p>Сума майбутньої угоди: <b>$10</b></p>
+<p>Експірація: <b>60 секунд</b></p>
+<p>Автоторгівля: <b>ВИМКНЕНО</b></p>
 </div>
 
 <script>
-
 async function update() {
-
     try {
+        const data = await fetch('/api/state').then(r => r.json());
 
-        const data =
-            await fetch('/api/state')
-            .then(response => response.json());
+        document.getElementById('asset').textContent = data.asset;
+        document.getElementById('status').textContent = data.message;
+        document.getElementById('candles').textContent = data.candles;
+        document.getElementById('signal').textContent = data.signal;
 
-        document.getElementById('asset').textContent =
-            data.asset;
-
-        document.getElementById('status').textContent =
-            data.message;
-
-        document.getElementById('signal').textContent =
-            data.signal;
-
-    } catch (error) {
-
-        document.getElementById('status').textContent =
-            'Немає зв’язку';
-
+    } catch (e) {
+        document.getElementById('status').textContent = 'Немає зв’язку';
     }
-
 }
 
 setInterval(update, 1500);
 update();
-
 </script>
 
 </body>
@@ -206,6 +243,7 @@ update();
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(
         app,
         host="0.0.0.0",
